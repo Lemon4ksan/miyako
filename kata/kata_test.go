@@ -269,19 +269,13 @@ func TestFSM_ConcurrentTransitionsRace(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range rounds {
-		wg.Add(2)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			_ = fsm.Transition(context.Background(), eventGo)
-		}()
+		})
 
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			_ = fsm.Transition(context.Background(), eventBack)
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -390,16 +384,10 @@ func TestFSM_CurrentState_Concurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	const readers = 50
-
-	for range readers {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+	for range 50 {
+		wg.Go(func() {
 			_ = fsm.CurrentState()
-		}()
+		})
 	}
 
 	wg.Wait()

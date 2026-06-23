@@ -467,6 +467,9 @@ orch.Stop() // all behaviors stopped cleanly
 | `spinlock` | `sync.Mutex` - heavier for short critical sections | `spinlock.SpinLock{}` → `Lock()` / `Unlock()` |
 | `generic` | Duplicated `map`/`filter`/`retry` per package | `generic.Map`, `generic.Retry`, `generic.Future` |
 | `behavior` | Goroutine + `sync.WaitGroup` + manual error propagation + shutdown coordination | `behavior.NewOrchestrator()` → `Register` / `Start` / `Stop` |
+| `limiter` | `sync.Mutex` + `golang.org/x/time/rate` - no key-based auto-cleanup, static algorithm | `limiter.NewAdaptiveLimiter(N)` / `limiter.NewKeyedLimiter[K](...)` |
+| `breaker` | `sony/gobreaker` - reflection/empty interfaces, no generics | `breaker.New[T](cfg)` → `Do` |
+| `pool` | channel/WaitGroup worker pool - static, no idle scale-down / panic safety | `pool.NewPool[T](cfg)` → `Submit` |
 
 ## 📊 Feature Matrix
 
@@ -486,6 +489,10 @@ This matrix shows where `miyako` focuses its design compared to Go's default pri
 | **Batching Request DataLoader** | ✗ | ✗ | **✓ (`generic.DataLoader`)** |
 | **Strict Generic State Machine** | ✗ | ✗ | **✓ (`kata.FSM`)** |
 | **Concurrent Behavior Orchestrator** | ✗ | ✗ | **✓ (`behavior.Orchestrator`)** |
+| **Vegas Congestion Limiter** | ✗ | ✗ | **✓ (`sync/limiter.AdaptiveLimiter`)** |
+| **Keyed Limiter with Auto-Cleanup** | ✗ | ✗ | **✓ (`sync/limiter.KeyedLimiter`)** |
+| **Generics-first Circuit Breaker** | ✗ | ✗ | **✓ (`sync/breaker.CircuitBreaker`)** |
+| **Auto-Scaling Dynamic Worker Pool** | ✗ | ✗ | **✓ (`pool.Pool`)** |
 
 ## 🍳 The Concurrency Kata: Tactical Recipes
 
@@ -660,6 +667,102 @@ defer cancel()
 orch.Start(ctx)
 // ... later
 orch.Stop() // all behaviors stopped cleanly
+```
+
+### 8. Dynamic Vegas-Style Concurrency Limiting (`sync/limiter.AdaptiveLimiter`)
+* **The Problem:** Setting a static concurrency limit (like a semaphore) on a client calling an upstream API leads to either underutilization (limit too low during healthy periods) or overloading the upstream (limit too high during spikes).
+* **The Solution:** `sync/limiter.AdaptiveLimiter` dynamically adjusts the concurrent slot limit by measuring response times (RTT). It automatically shrinks the limit when the upstream gets congested (RTT rises) and grows it when the upstream is healthy.
+
+```go
+// Start with an initial concurrency limit of 10.0
+lim := limiter.NewAdaptiveLimiter(10.0)
+
+func HandleRequest(ctx context.Context) error {
+    if err := lim.Acquire(ctx); err != nil {
+        return err // Context timeout or cancellation
+    }
+
+    start := time.Now()
+    err := callUpstreamAPI(ctx)
+    rtt := time.Since(start)
+
+    // Release slot and update RTT metrics to dynamically recalculate the limit
+    lim.Release(rtt)
+
+    return err
+}
+```
+
+### 9. Keyed Rate Limiter with Auto-Teardown (`sync/limiter.KeyedLimiter`)
+* **The Problem:** You need to rate-limit users by their API key or IP address. Storing a standard `rate.Limiter` per key in a map will leak memory over time as unique keys connect and never return.
+* **The Solution:** Named after **Sekisho** (КПП / barrier), `limiter.KeyedLimiter` dynamically allocates rate limiters for active keys and automatically sweeps them from memory after a configured TTL of inactivity.
+
+```go
+// Rate limit: 5 requests/sec, burst size 10, TTL 5 minutes
+kl := limiter.NewKeyedLimiter[string](rate.Limit(5), 10, 5*time.Minute)
+defer kl.Close()
+
+func HandleUserRequest(ctx context.Context, userID string) error {
+    // Dynamically retrieves/creates limiter for userID and resets its inactivity TTL
+    if err := kl.Wait(ctx, userID); err != nil {
+        return err // Limit exceeded or context cancelled
+    }
+
+    return processRequest()
+}
+```
+
+### 10. Generics-First Circuit Breaker (`sync/breaker.CircuitBreaker`)
+* **The Problem:** Downstream microservice outages can cascade, exhausting caller threads. Standard breakers rely on legacy reflection or `interface{}` casting, which is verbose and slow.
+* **The Solution:** Named after **Yoroi** (鎧 / defensive armor), `breaker.CircuitBreaker` wraps execution with strict compile-time type safety, failing fast when failure rates exceed thresholds, and performing safe single-request trials in Half-Open state.
+
+```go
+cb := breaker.New[User](breaker.Config{
+    FailureThreshold: 0.5,              // Trip when 50% of requests fail
+    Cooldown:         10 * time.Second, // Wait 10s before testing Half-Open
+    MinRequests:      5,                // Gather at least 5 requests before tripping
+})
+
+user, err := cb.Do(ctx, func(ctx context.Context) (User, error) {
+    return userClient.Fetch(ctx)
+})
+if err != nil {
+    if errors.Is(err, breaker.ErrCircuitOpen) {
+        // Fast-path recovery or fallback
+        return getCachedUser(), nil
+    }
+
+    return User{}, err
+}
+```
+
+### 11. Dynamic Worker Pool with Auto-Scaling (`pool.Pool`)
+* **The Problem:** Static worker pools waste system resources by keeping idle goroutines alive during quiet hours, or bottleneck the pipeline when tasks spike.
+* **The Solution:** Named after **Ronin** (浪人 / masterless samurai), `pool.Pool` scales worker goroutines dynamically between `MinWorkers` and `MaxWorkers`. It kills idle workers after an `IdleTimeout` and isolates task panics to protect the pool structure.
+
+```go
+p := pool.NewPool[int](pool.Config{
+    MinWorkers:  2,
+    MaxWorkers:  20,
+    IdleTimeout: 10 * time.Second,
+    QueueLimit:  100,
+})
+defer p.Close()
+
+// Submit task and receive a Future
+future, err := p.Submit(ctx, func(ctx context.Context) (int, error) {
+    return performHeavyTask(ctx)
+})
+if err != nil {
+    if errors.Is(err, pool.ErrQueueFull) {
+        // Handle overflow (fail fast)
+    }
+
+    return err
+}
+
+// Block and retrieve value when ready
+result, err := future.Get(ctx)
 ```
 
 ## 🔬 The Contrast: Raw FSM vs. `kata`

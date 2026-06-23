@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package sync provides a thread-safe lazy initializer with reset support.
+// Package lazy provides a thread-safe lazy initializer with reset support.
 //
 // Unlike [sync.Once], the cached value can be discarded via [Lazy.Reset],
 // causing the next [Lazy.Get] to re-run the initialization function. This is

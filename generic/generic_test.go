@@ -214,7 +214,7 @@ func TestSingleFlight(t *testing.T) {
 	wg.Add(numGoroutines)
 
 	results := make([]int, numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(idx int) {
 			defer wg.Done()
 

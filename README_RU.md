@@ -466,6 +466,9 @@ orch.Stop() // все поведения корректно остановлен
 | `spinlock` | `sync.Mutex` - тяжелее для коротких секций | `spinlock.SpinLock{}` → `Lock()` / `Unlock()` |
 | `generic` | Дублированные `map`/`filter`/`retry` в каждом пакете | `generic.Map`, `generic.Retry`, `generic.Future` |
 | `behavior` | Горутина + `sync.WaitGroup` + ручное распространение ошибок + координация остановки | `behavior.NewOrchestrator()` → `Register` / `Start` / `Stop` |
+| `limiter` | `sync.Mutex` + `golang.org/x/time/rate` - без автоматической очистки ключей, статический лимит | `limiter.NewAdaptiveLimiter(N)` / `limiter.NewKeyedLimiter[K](...)` |
+| `breaker` | `sony/gobreaker` - рефлексия/пустые интерфейсы, нет дженериков | `breaker.New[T](cfg)` → `Do` |
+| `pool` | пул воркеров на каналах/WaitGroup - статический, нет сжатия при простое / паниках | `pool.NewPool[T](cfg)` → `Submit` |
 
 ## 📊 Матрица возможностей
 
@@ -485,6 +488,10 @@ orch.Stop() // все поведения корректно остановлен
 | **Пакетная загрузка данных (DataLoader)** | ✗ | ✗ | **✓ (`generic.DataLoader`)** |
 | **Строгий типизированный конечный автомат** | ✗ | ✗ | **✓ (`kata.FSM`)** |
 | **Оркестратор конкурентных поведений** | ✗ | ✗ | **✓ (`behavior.Orchestrator`)** |
+| **Адаптивный лимитер алгоритма Vegas** | ✗ | ✗ | **✓ (`sync/limiter.AdaptiveLimiter`)** |
+| **Ключевой лимитер с авто-очисткой** | ✗ | ✗ | **✓ (`sync/limiter.KeyedLimiter`)** |
+| **Типизированный предохранитель (Circuit Breaker)** | ✗ | ✗ | **✓ (`sync/breaker.CircuitBreaker`)** |
+| **Динамический авто-масштабируемый пул воркеров** | ✗ | ✗ | **✓ (`pool.Pool`)** |
 
 ## 🍳 Ката конкурентности: Тактические рецепты
 
@@ -659,6 +666,102 @@ defer cancel()
 orch.Start(ctx)
 // ... позже
 orch.Stop() // все поведения корректно остановлены
+```
+
+### 8. Адаптивное ограничение конкурентности алгоритма Vegas (`sync/limiter.AdaptiveLimiter`)
+* **Проблема:** Установка статического лимита конкурентности (как в семафоре) для клиента внешнего API приводит либо к недогрузке (лимит слишком низкий во время стабильной работы), либо к перегрузке внешнего сервиса (лимит слишком высокий при сбоях).
+* **Решение:** `sync/limiter.AdaptiveLimiter` динамически регулирует количество доступных конкурентных слотов на основе замера времени ответа (RTT). Он автоматически сжимает лимит при возникновении сетевых задержек (росте RTT) и плавно расширяет его, когда удаленный сервис здоров.
+
+```go
+// Инициализируем адаптивный лимитер с начальным ограничением в 10.0
+lim := limiter.NewAdaptiveLimiter(10.0)
+
+func HandleRequest(ctx context.Context) error {
+    if err := lim.Acquire(ctx); err != nil {
+        return err // Истек таймаут контекста или операция отменена
+    }
+
+    start := time.Now()
+    err := callUpstreamAPI(ctx)
+    rtt := time.Since(start)
+
+    // Освобождаем слот и передаем RTT для динамического пересчета лимита
+    lim.Release(rtt)
+
+    return err
+}
+```
+
+### 9. Ключевой Rate Limiter с авто-очисткой за собой (`sync/limiter.KeyedLimiter`)
+* **Проблема:** Требуется ограничить частоту запросов пользователей по их API-ключам или IP-адресам. Хранение отдельных `rate.Limiter` в `map` под мьютексом приводит к утечке памяти, поскольку старые неактивные клиенты никогда не удаляются.
+* **Решение:** Названный в честь **Sekisho** (КПП / застава), `limiter.KeyedLimiter` динамически выделяет лимитеры для активных ключей и автоматически вычищает их из памяти после истечения заданного TTL неактивности.
+
+```go
+// Ограничение: 5 запросов/сек, бакет 10, TTL неактивности 5 минут
+kl := limiter.NewKeyedLimiter[string](rate.Limit(5), 10, 5*time.Minute)
+defer kl.Close()
+
+func HandleUserRequest(ctx context.Context, userID string) error {
+    // Динамически находит/создает лимитер для userID и сбрасывает его TTL
+    if err := kl.Wait(ctx, userID); err != nil {
+        return err // Превышен лимит запросов или отменен контекст
+    }
+
+    return processRequest()
+}
+```
+
+### 10. Типизированный предохранитель (`sync/breaker.CircuitBreaker`)
+* **Проблема:** Сбои во внешних сервисах могут приводить к каскадному отказу всей системы, забивая пул потоков вызывающей стороны. Популярные библиотеки используют рефлексию или приведение типов через пустые интерфейсы `interface{}`, что неэффективно и небезопасно.
+* **Решение:** Названный в честь **Yoroi** (鎧 / защитный доспех самурая), `breaker.CircuitBreaker` оборачивает выполнение операций с полной типобезопасностью на этапе компиляции, мгновенно сбрасывая запросы при превышении порога ошибок и проводя строго одиночные проверочные запросы в состоянии Half-Open.
+
+```go
+cb := breaker.New[User](breaker.Config{
+    FailureThreshold: 0.5,              // Переход в Open при 50% ошибок
+    Cooldown:         10 * time.Second, // 10 секунд ожидания перед переходом в Half-Open
+    MinRequests:      5,                // Анализировать статистику минимум после 5 запросов
+})
+
+user, err := cb.Do(ctx, func(ctx context.Context) (User, error) {
+    return userClient.Fetch(ctx)
+})
+if err != nil {
+    if errors.Is(err, breaker.ErrCircuitOpen) {
+        // Быстрое восстановление (fallback): отдаем данные из кэша
+        return getCachedUser(), nil
+    }
+
+    return User{}, err
+}
+```
+
+### 11. Динамический пул воркеров с авто-масштабированием (`pool.Pool`)
+* **Проблема:** Статические пулы воркеров нерационально расходуют ресурсы сервера, удерживая горутины в памяти во время отсутствия задач, и становятся «бутылочным горлышком» при всплесках нагрузки.
+* **Решение:** Названный в честь **Ronin** (浪人 / свободный самурай), `pool.Pool` динамически масштабирует воркеры в пределах диапазона от `MinWorkers` до `MaxWorkers`. Он завершает лишние воркеры по таймауту простоя `IdleTimeout` и безопасно изолирует паники внутри задач, сохраняя жизнеспособность пула.
+
+```go
+p := pool.NewPool[int](pool.Config{
+    MinWorkers:  2,
+    MaxWorkers:  20,
+    IdleTimeout: 10 * time.Second,
+    QueueLimit:  100,
+})
+defer p.Close()
+
+// Отправляем задачу в пул и получаем Future
+future, err := p.Submit(ctx, func(ctx context.Context) (int, error) {
+    return performHeavyTask(ctx)
+})
+if err != nil {
+    if errors.Is(err, pool.ErrQueueFull) {
+        // Обрабатываем переполнение очереди
+    }
+
+    return err
+}
+
+// Блокируем горутину и забираем результат по готовности
+result, err := future.Get(ctx)
 ```
 
 ## 🔬 Контраст: Сырой FSM vs. `kata`
